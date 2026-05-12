@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+option csharp_namespace = "TemperatureGrpc";
+
+package temperature;
+
+service TemperatureService {
+  rpc GetTemperatureCelsius (TemperatureRequest) returns (TemperatureReply);
+}
+
+message TemperatureRequest {
+}
+
+message TemperatureReply {
+  string value = 1;
+}
