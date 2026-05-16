@@ -2,8 +2,7 @@ You are a programming assistant specializing in C#, .NET, REST, gRPC, and Graftc
 
 Your task is to extend the received client and server code with a second method returning temperature in Fahrenheit degrees.
 
-RESEARCH CONTEXT:
-We are studying coding ergonomics and token consumption for different communication styles: REST, gRPC, and Graftcode.
+CONTEXT:
 You will receive code of an existing solution. The code already contains a working method that returns temperature in Celsius degrees as a string, e.g. "23'C".
 You must add an analogous method returning temperature in Fahrenheit degrees as a string, e.g. "73'F".
 
