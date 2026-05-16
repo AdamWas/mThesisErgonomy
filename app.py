@@ -5,6 +5,7 @@ import csv
 import json
 import os
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
@@ -174,13 +175,23 @@ def usage_to_dict(completion: Any) -> dict[str, Any]:
 def fetch_supported_parameters(
     api_key: str, timeout_seconds: float
 ) -> dict[str, set[str]] | None:
+    context = None
+    try:
+        import certifi
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+
     request = urllib.request.Request(
         OPENROUTER_MODELS_URL,
         headers={"Authorization": f"Bearer {api_key}"},
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        with urllib.request.urlopen(
+            request, timeout=timeout_seconds, context=context
+        ) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
         print(f"Warning: could not fetch OpenRouter model metadata: {error}")
