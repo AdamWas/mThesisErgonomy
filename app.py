@@ -19,6 +19,7 @@ DEFAULT_MODELS_FILE = APP_DIR / "models.txt"
 DEFAULT_OUTPUT_DIR = APP_DIR / "results"
 DEFAULT_TEMPERATURE = 0
 DEFAULT_MAX_TOKENS = 12000
+DEFAULT_ITERATIONS = 1
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 CASES = {
@@ -330,6 +331,8 @@ def append_usage_row(path: Path, row: dict[str, Any]) -> None:
         "timestamp_utc",
         "run_id",
         "request_id",
+        "iteration",
+        "iteration_count",
         "status",
         "case",
         "case_name",
@@ -382,6 +385,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
     )
 
     models = load_models(args.models_file, args.model)
+    if args.iterations < 1:
+        raise RuntimeError("--iterations must be greater than or equal to 1.")
+
     technologies = args.technology or list(TECHNOLOGIES)
     selected_cases = build_selected_cases(args)
     supported_parameters = fetch_supported_parameters(
@@ -391,130 +397,147 @@ def run_benchmark(args: argparse.Namespace) -> None:
     run_dir = args.output_dir / run_id
     request_index = 0
 
-    for case_key, case in selected_cases.items():
-        template_path = case["prompt_template"]
-        template = template_path.read_text(encoding="utf-8")
+    for iteration in range(1, args.iterations + 1):
+        iteration_key = f"iteration_{iteration:02d}"
 
-        for technology in technologies:
-            prompt = build_prompt(template, technology)
+        for case_key, case in selected_cases.items():
+            template_path = case["prompt_template"]
+            template = template_path.read_text(encoding="utf-8")
 
-            for model in models:
-                request_index += 1
-                request_id = f"{request_index:04d}"
-                timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-                model_dir = run_dir / case_key / technology / f"{request_id}_{slugify(model)}"
-                prompt_path = model_dir / "prompt.md"
-                response_path = model_dir / "response.md"
-                metadata_path = model_dir / "metadata.json"
-                print(f"Running {case_key} / {technology} with {model}...")
+            for technology in technologies:
+                prompt = build_prompt(template, technology)
 
-                write_text(prompt_path, prompt)
-                completion = None
-                content = ""
-                error: dict[str, str] | None = None
-                completion_kwargs = build_completion_kwargs(
-                    model, prompt, args, supported_parameters
-                )
-                started_at = time.perf_counter()
+                for model in models:
+                    request_index += 1
+                    request_id = f"{request_index:04d}"
+                    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                    model_dir = (
+                        run_dir
+                        / iteration_key
+                        / case_key
+                        / technology
+                        / f"{request_id}_{slugify(model)}"
+                    )
+                    prompt_path = model_dir / "prompt.md"
+                    response_path = model_dir / "response.md"
+                    metadata_path = model_dir / "metadata.json"
+                    print(
+                        f"Running {iteration_key} / {case_key} / "
+                        f"{technology} with {model}..."
+                    )
 
-                try:
-                    completion = client.chat.completions.create(**completion_kwargs)
-                    content = completion.choices[0].message.content or ""
-                except Exception as exception:
-                    error = {
-                        "type": type(exception).__name__,
-                        "message": str(exception),
+                    write_text(prompt_path, prompt)
+                    completion = None
+                    content = ""
+                    error: dict[str, str] | None = None
+                    completion_kwargs = build_completion_kwargs(
+                        model, prompt, args, supported_parameters
+                    )
+                    started_at = time.perf_counter()
+
+                    try:
+                        completion = client.chat.completions.create(**completion_kwargs)
+                        content = completion.choices[0].message.content or ""
+                    except Exception as exception:
+                        error = {
+                            "type": type(exception).__name__,
+                            "message": str(exception),
+                        }
+
+                    duration_seconds = round(time.perf_counter() - started_at, 3)
+                    usage = usage_to_dict(completion) if completion is not None else {}
+                    usage_validation = validate_usage(usage)
+                    response_validation = validate_response_format(content)
+                    status = "success"
+                    if error is not None:
+                        status = "failed"
+                    elif not usage_validation["valid"]:
+                        status = "invalid_usage"
+
+                    metadata = {
+                        "timestamp_utc": timestamp,
+                        "run_id": run_id,
+                        "request_id": request_id,
+                        "iteration": iteration,
+                        "iteration_count": args.iterations,
+                        "status": status,
+                        "case": case_key,
+                        "case_name": case["name"],
+                        "technology": technology,
+                        "solution_type": TECHNOLOGIES[technology]["solution_type"],
+                        "model": model,
+                        "model_metadata_available": (
+                            supported_parameters is not None
+                            and model in supported_parameters
+                        ),
+                        "model_supported_parameters": sorted(
+                            supported_parameters.get(model, [])
+                            if supported_parameters is not None
+                            else []
+                        ),
+                        "temperature": args.temperature,
+                        "max_tokens": args.max_tokens,
+                        "duration_seconds": duration_seconds,
+                        "prompt_template": display_path(template_path),
+                        "prompt_file": display_path(prompt_path),
+                        "response_file": display_path(response_path),
+                        "metadata_file": display_path(metadata_path),
+                        "prompt_characters": len(prompt),
+                        "source_files": TECHNOLOGIES[technology]["paths"],
+                        "request": request_metadata(completion_kwargs, prompt_path, prompt),
+                        "usage": usage,
+                        "usage_validation": usage_validation,
+                        "response_validation": response_validation,
+                        "error": error,
+                        "completion": (
+                            completion_to_dict(completion)
+                            if completion is not None
+                            else None
+                        ),
                     }
 
-                duration_seconds = round(time.perf_counter() - started_at, 3)
-                usage = usage_to_dict(completion) if completion is not None else {}
-                usage_validation = validate_usage(usage)
-                response_validation = validate_response_format(content)
-                status = "success"
-                if error is not None:
-                    status = "failed"
-                elif not usage_validation["valid"]:
-                    status = "invalid_usage"
+                    write_text(response_path, content)
+                    write_text(metadata_path, json.dumps(metadata, ensure_ascii=False, indent=2))
+                    usage_row = {
+                        "timestamp_utc": timestamp,
+                        "run_id": run_id,
+                        "request_id": request_id,
+                        "iteration": iteration,
+                        "iteration_count": args.iterations,
+                        "status": status,
+                        "case": case_key,
+                        "case_name": case["name"],
+                        "technology": technology,
+                        "solution_type": TECHNOLOGIES[technology]["solution_type"],
+                        "model": model,
+                        "usage_valid": usage_validation["valid"],
+                        "missing_usage_fields": ",".join(
+                            usage_validation["missing_fields"]
+                        ),
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "total_tokens": usage.get("total_tokens"),
+                        "response_format_valid": response_validation["valid"],
+                        "response_file_count": response_validation["file_count"],
+                        "response_format_notes": ",".join(response_validation["notes"]),
+                        "error_type": error["type"] if error else "",
+                        "error_message": error["message"] if error else "",
+                        "duration_seconds": duration_seconds,
+                        "prompt_characters": len(prompt),
+                        "request_parameters_json": json.dumps(
+                            metadata["request"], ensure_ascii=False
+                        ),
+                        "usage_json": json.dumps(usage, ensure_ascii=False),
+                        "prompt_file": display_path(prompt_path),
+                        "response_file": display_path(response_path),
+                        "metadata_file": display_path(metadata_path),
+                    }
+                    append_usage_row(run_dir / "usage.csv", usage_row)
+                    append_usage_row(run_dir / iteration_key / "usage.csv", usage_row)
+                    append_usage_row(run_dir / case_key / "usage.csv", usage_row)
+                    append_usage_row(args.output_dir / "usage_all.csv", usage_row)
 
-                metadata = {
-                    "timestamp_utc": timestamp,
-                    "run_id": run_id,
-                    "request_id": request_id,
-                    "status": status,
-                    "case": case_key,
-                    "case_name": case["name"],
-                    "technology": technology,
-                    "solution_type": TECHNOLOGIES[technology]["solution_type"],
-                    "model": model,
-                    "model_metadata_available": (
-                        supported_parameters is not None
-                        and model in supported_parameters
-                    ),
-                    "model_supported_parameters": sorted(
-                        supported_parameters.get(model, [])
-                        if supported_parameters is not None
-                        else []
-                    ),
-                    "temperature": args.temperature,
-                    "max_tokens": args.max_tokens,
-                    "duration_seconds": duration_seconds,
-                    "prompt_template": display_path(template_path),
-                    "prompt_file": display_path(prompt_path),
-                    "response_file": display_path(response_path),
-                    "metadata_file": display_path(metadata_path),
-                    "prompt_characters": len(prompt),
-                    "source_files": TECHNOLOGIES[technology]["paths"],
-                    "request": request_metadata(completion_kwargs, prompt_path, prompt),
-                    "usage": usage,
-                    "usage_validation": usage_validation,
-                    "response_validation": response_validation,
-                    "error": error,
-                    "completion": (
-                        completion_to_dict(completion)
-                        if completion is not None
-                        else None
-                    ),
-                }
-
-                write_text(response_path, content)
-                write_text(metadata_path, json.dumps(metadata, ensure_ascii=False, indent=2))
-                usage_row = {
-                    "timestamp_utc": timestamp,
-                    "run_id": run_id,
-                    "request_id": request_id,
-                    "status": status,
-                    "case": case_key,
-                    "case_name": case["name"],
-                    "technology": technology,
-                    "solution_type": TECHNOLOGIES[technology]["solution_type"],
-                    "model": model,
-                    "usage_valid": usage_validation["valid"],
-                    "missing_usage_fields": ",".join(
-                        usage_validation["missing_fields"]
-                    ),
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "completion_tokens": usage.get("completion_tokens"),
-                    "total_tokens": usage.get("total_tokens"),
-                    "response_format_valid": response_validation["valid"],
-                    "response_file_count": response_validation["file_count"],
-                    "response_format_notes": ",".join(response_validation["notes"]),
-                    "error_type": error["type"] if error else "",
-                    "error_message": error["message"] if error else "",
-                    "duration_seconds": duration_seconds,
-                    "prompt_characters": len(prompt),
-                    "request_parameters_json": json.dumps(
-                        metadata["request"], ensure_ascii=False
-                    ),
-                    "usage_json": json.dumps(usage, ensure_ascii=False),
-                    "prompt_file": display_path(prompt_path),
-                    "response_file": display_path(response_path),
-                    "metadata_file": display_path(metadata_path),
-                }
-                append_usage_row(run_dir / "usage.csv", usage_row)
-                append_usage_row(run_dir / case_key / "usage.csv", usage_row)
-                append_usage_row(args.output_dir / "usage_all.csv", usage_row)
-
-                print(f"Saved {display_path(response_path)} [{status}]")
+                    print(f"Saved {display_path(response_path)} [{status}]")
 
 
 def build_selected_cases(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
@@ -575,6 +598,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_TOKENS,
         help="Maximum response tokens to request when supported by the model.",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=DEFAULT_ITERATIONS,
+        help="Number of repetitions for every case, technology, and model.",
     )
     parser.add_argument(
         "--model-metadata-timeout",
